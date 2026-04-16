@@ -5,6 +5,7 @@ Only the head is trained; the backbone is fixed throughout.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
 from data import CLASSES_PER_TASK
 
@@ -16,10 +17,12 @@ class ContinualResNet(nn.Module):
     """
 
     def __init__(self, classes_per_task: int = CLASSES_PER_TASK,
-                 unfreeze_last_block: bool = False):
+                 unfreeze_last_block: bool = False,
+                 scale: float = 1.0):
         super().__init__()
         self.classes_per_task    = classes_per_task
         self.unfreeze_last_block = unfreeze_last_block
+        self.scale               = scale   # temperature for cosine classifier (e.g. 10.0)
 
         # ── backbone ─────────────────────────────────────────────────────────
         # Try pretrained weights; fall back to random init if offline
@@ -88,7 +91,10 @@ class ContinualResNet(nn.Module):
             with torch.no_grad():
                 feats = self.backbone(x)
         feats = feats.flatten(1)              # (B, 512)
-        return self.head(feats)               # (B, num_classes_so_far)
+        if self.scale != 1.0:
+            feats = F.normalize(feats, dim=1) # cosine classifier: unit-norm features
+        logits = self.head(feats)             # (B, num_classes_so_far)
+        return logits * self.scale
 
     def get_features(self, x: torch.Tensor) -> torch.Tensor:
         """Return backbone features (no grad)."""

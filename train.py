@@ -45,19 +45,22 @@ def get_device():
 # ── single method run ────────────────────────────────────────────────────────
 
 def run_method(method_name: str, device: torch.device,
-               align: bool = False, unfreeze: bool = False) -> dict:
+               align: bool = False, unfreeze: bool = False,
+               scale: float = 1.0) -> dict:
     label = method_name.upper()
     if unfreeze:
         label += " + Unfreeze Layer4"
     if align:
         label += " + Prototype Alignment"
+    if scale != 1.0:
+        label += f" + Scale={scale}"
     print(f"\n{'='*60}")
     print(f"  Method: {label}")
     print(f"{'='*60}")
 
     method_cls = METHOD_REGISTRY[method_name]
     method     = method_cls()
-    model      = ContinualResNet(unfreeze_last_block=unfreeze).to(device)
+    model      = ContinualResNet(unfreeze_last_block=unfreeze, scale=scale).to(device)
 
     acc_matrix  = np.zeros((NUM_TASKS, NUM_TASKS))   # [after_task, task_id]
     task_times  = []
@@ -103,12 +106,13 @@ def run_method(method_name: str, device: torch.device,
         task_rams.append(tracker.peak_ram_mb)
         print(f"  Time: {tracker.elapsed_sec:.1f}s  |  RAM Δ: {tracker.peak_ram_mb:.1f} MB")
 
-        # After-task hook (EWC fisher, etc.)
-        method.after_task(model, task_id, train_loader, device)
-
-        # Optional prototype alignment (fixes logit imbalance / task-recency bias)
+        # Optional prototype alignment — runs BEFORE after_task so EWC snapshots
+        # the aligned weights (protects post-alignment state, not raw gradient state)
         if align:
             apply_prototype_alignment(model, train_loader, task_id, device, proto_store)
+
+        # After-task hook (EWC fisher computed on aligned weights when align=True)
+        method.after_task(model, task_id, train_loader, device)
 
         # ── evaluation on all seen tasks ──────────────────────────────────────
         model.eval()
@@ -130,11 +134,14 @@ def run_method(method_name: str, device: torch.device,
         suffix += "_align"
     if unfreeze:
         suffix += "_ft"
+    if scale != 1.0:
+        suffix += f"_s{int(scale)}"
     result_key = f"{method_name}{suffix}"
     results = {
         "method":       result_key,
         "align":        align,
         "unfreeze":     unfreeze,
+        "scale":        scale,
         "acc_matrix":   acc_matrix.tolist(),
         "aa":           round(aa * 100, 2),
         "bwt":          round(bwt * 100, 2),
@@ -160,6 +167,8 @@ def main():
                         help="Apply prototype alignment after each task")
     parser.add_argument("--unfreeze", action="store_true",
                         help="Unfreeze ResNet-18 layer4 during training (fine-tune backbone)")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Cosine classifier temperature scale (e.g. 10.0)")
     args = parser.parse_args()
 
     device = get_device()
@@ -169,7 +178,8 @@ def main():
     all_results = {}
 
     for m in methods:
-        all_results[m] = run_method(m, device, align=args.align, unfreeze=args.unfreeze)
+        all_results[m] = run_method(m, device, align=args.align,
+                                    unfreeze=args.unfreeze, scale=args.scale)
 
     if len(methods) > 1:
         parts = []
@@ -177,6 +187,8 @@ def main():
             parts.append("+align")
         if args.unfreeze:
             parts.append("+ft")
+        if args.scale != 1.0:
+            parts.append(f"+scale={args.scale}")
         suffix = " (" + ", ".join(parts) + ")" if parts else ""
         print(f"\n\n── Summary Table{suffix} ─────────────────────────────────────")
         print(f"{'Method':<10} {'AA (%)':>8} {'BWT (%)':>9} {'Time/task (s)':>15} {'RAM Δ (MB)':>12}")
